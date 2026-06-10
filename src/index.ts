@@ -57,6 +57,11 @@ const DIGEST_MAX_TOKENS = 400;
 // ─── Vectorize constants ──────────────────────────────────────────────────────
 
 const VECTORIZE_TOP_K_MULTIPLIER = 3;
+// getByIds batch size for tag-scoped recall — Vectorize rejects more than 20 IDs
+// per call (VECTOR_GET_ERROR, code 40007)
+const VECTORIZE_GET_BY_IDS_BATCH = 20;
+// D1 allows at most 100 bound parameters per query
+const D1_MAX_BOUND_PARAMS = 100;
 
 // ─── Runtime state ────────────────────────────────────────────────────────────
 
@@ -387,6 +392,20 @@ export function getHalfLifeMs(tags: string[]): number {
   if (tags.includes("context")) return 180 * 24 * 60 * 60 * 1000; // 6 months
   if (tags.includes("work")) return 90 * 24 * 60 * 60 * 1000; // 3 months
   return 30 * 24 * 60 * 60 * 1000; // 30 days default
+}
+
+// Cosine similarity between two vectors. BGE embeddings are not normalized,
+// so the denominator matters — this keeps tag-path scores on the same scale
+// as Vectorize's cosine query scores.
+export function cosineSim(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  // Guard on the raw norms, not the sqrt product — the product can underflow to 0
+  return normA === 0 || normB === 0 ? 0 : dot / Math.sqrt(normA * normB);
 }
 
 export function rerankWithTimeDecay(
@@ -915,39 +934,65 @@ export async function recallEntries(
 
   const values = await embed(embedQuery, env);
 
-  // If tag filter, resolve matching IDs from D1 first (D1 is source of truth for tags)
-  let tagFilterIds: Set<string> | null = null;
+  let results: { matches: VectorizeMatch[] };
   if (tag) {
+    // Tag path: score the tag's own vectors directly. An unconstrained Vectorize
+    // query caps at 50 candidates, silently dropping tagged entries whose global
+    // semantic rank falls outside the top 50 (issue #141). D1 is the source of
+    // truth for tags and already stores each entry's vector_ids.
     const { results: tagRows } = await env.DB.prepare(
-      `SELECT id FROM entries WHERE tags LIKE ?`
+      `SELECT id, vector_ids FROM entries WHERE tags LIKE ?`
     ).bind(`%"${tag}"%`).all();
-    tagFilterIds = new Set((tagRows as any[]).map(r => r.id as string));
-    if (tagFilterIds.size === 0) return { matches: [], insight: "" };
-  }
+    if (!tagRows.length) return { matches: [], insight: "" };
 
-  // Query Vectorize without filter — tag filtering happens in-memory below
-  // Cloudflare Vectorize caps topK at 50 when returnMetadata="all" (error 40025)
-  const vectorizeTopK = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
-  let results = await env.VECTORIZE.query(values, {
-    topK: vectorizeTopK,
-    returnMetadata: "all",
-  });
+    const vectorIds = [...new Set(
+      (tagRows as any[]).flatMap(r => JSON.parse((r.vector_ids as string) ?? "[]") as string[])
+    )];
+    if (!vectorIds.length) return { matches: [], insight: "" };
 
-  if (results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
+    const vectors: VectorizeVector[] = [];
+    for (let i = 0; i < vectorIds.length; i += VECTORIZE_GET_BY_IDS_BATCH) {
+      vectors.push(...await env.VECTORIZE.getByIds(vectorIds.slice(i, i + VECTORIZE_GET_BY_IDS_BATCH)));
+    }
+
+    results = {
+      matches: vectors.map(v => ({
+        id: v.id,
+        score: cosineSim(values, v.values as number[]),
+        metadata: v.metadata,
+      })) as VectorizeMatch[],
+    };
+  } else {
+    // Cloudflare Vectorize caps topK at 50 when returnMetadata="all" (error 40025)
+    const vectorizeTopK = Math.min(topK * VECTORIZE_TOP_K_MULTIPLIER, 50);
     results = await env.VECTORIZE.query(values, {
-      topK: 50,
+      topK: vectorizeTopK,
       returnMetadata: "all",
     });
+
+    if (results.matches.length && results.matches[0].score < DUPLICATE_FLAG_THRESHOLD) {
+      results = await env.VECTORIZE.query(values, {
+        topK: 50,
+        returnMetadata: "all",
+      });
+    }
   }
 
   if (!results.matches.length) return { matches: [], insight: "" };
 
-  // Fetch recall_count and importance_score for all candidates to use in scoring
+  // Fetch recall_count and importance_score for all candidates to use in scoring.
+  // The tag path can produce far more than 100 candidates, so chunk the IN query
+  // to stay under D1's bound-parameter limit.
   const candidateIds = [...new Set(results.matches.map(m => (m.metadata as any)?.parentId ?? m.id))] as string[];
-  const rcPlaceholders = candidateIds.map(() => "?").join(", ");
-  const { results: rcRows } = await env.DB.prepare(
-    `SELECT id, recall_count, importance_score FROM entries WHERE id IN (${rcPlaceholders})`
-  ).bind(...candidateIds).all() as { results: { id: string; recall_count: number; importance_score: number }[] };
+  const rcRows: { id: string; recall_count: number; importance_score: number }[] = [];
+  for (let i = 0; i < candidateIds.length; i += D1_MAX_BOUND_PARAMS) {
+    const batch = candidateIds.slice(i, i + D1_MAX_BOUND_PARAMS);
+    const rcPlaceholders = batch.map(() => "?").join(", ");
+    const { results: rows } = await env.DB.prepare(
+      `SELECT id, recall_count, importance_score FROM entries WHERE id IN (${rcPlaceholders})`
+    ).bind(...batch).all() as { results: { id: string; recall_count: number; importance_score: number }[] };
+    rcRows.push(...rows);
+  }
   const recallCounts = new Map(rcRows.map(r => [r.id, r.recall_count ?? 0]));
   const importanceScores = new Map(rcRows.map(r => [r.id, r.importance_score ?? 0]));
 
@@ -957,8 +1002,6 @@ export async function recallEntries(
   const deduped = reranked.filter((m) => {
     const parentId = (m.metadata as any)?.parentId ?? m.id;
     if (seen.has(parentId)) return false;
-    // Apply tag filter against D1-resolved IDs
-    if (tagFilterIds && !tagFilterIds.has(parentId)) return false;
     seen.add(parentId);
     return true;
   }).slice(0, topK);
