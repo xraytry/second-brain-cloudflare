@@ -29,14 +29,14 @@ And unlike the built-in memory inside any single app, this one is yours. It live
 
 Connect Second Brain to whichever AI tools you use. Then tell it things once. It finds them later by meaning, so asking “what did I decide about the pricing model?” surfaces the right note even if you never used those exact words when you saved it.
 
-|Tool         |What it does                                                |
-|-------------|------------------------------------------------------------|
-|`remember`   |Store anything: ideas, decisions, project context           |
-|`append`     |Add updates to an existing entry without creating duplicates|
-|`update`     |Replace an entry’s content entirely                         |
-|`recall`     |Finds memories by meaning, not exact wording                |
-|`list_recent`|Browse recent memories by date                              |
-|`forget`     |Delete an entry                                             |
+| Tool          | What it does                                                 |
+| ------------- | ------------------------------------------------------------ |
+| `remember`    | Store anything: ideas, decisions, project context            |
+| `append`      | Add updates to an existing entry without creating duplicates |
+| `update`      | Replace an entry’s content entirely                          |
+| `recall`      | Finds memories by meaning, not exact wording                 |
+| `list_recent` | Browse recent memories by date                               |
+| `forget`      | Delete an entry                                              |
 
 -----
 
@@ -102,24 +102,7 @@ OAuth needs a KV namespace (`OAUTH_KV`) to store tokens and client registrations
 
 The **Deploy to Cloudflare** button provisions it automatically.
 
-**Deploying manually**, follow these steps. Wrangler validates the entire config before running any command, so the order matters:
-
-1. Remove the placeholder `[[kv_namespaces]]` block from `wrangler.toml` (the one with
-   the empty `id`).
-1. Create the namespace:
-   
-   ```bash
-   wrangler kv namespace create OAUTH_KV
-   ```
-1. Copy the `id` from the output and add it back to `wrangler.toml`:
-   
-   ```toml
-   [[kv_namespaces]]
-   binding = "OAUTH_KV"
-   id = "<paste id here>"
-   ```
-
-> The key change is the warning to add the real `id` before running any other wrangler commands, since wrangler validates the entire config upfront and rejects an empty string.
+**Deploying manually:** Simply run `npm run deploy`. Wrangler will auto-provision the necessary resources and fill out the rest of your wrangler.jsonc file.
 
 -----
 
